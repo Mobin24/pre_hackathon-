@@ -1,0 +1,40 @@
+# Node / Frontend
+node_modules/
+dist/
+build/
+.next/
+.vite/
+*.log
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.local
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.puku/
+
+# Coverage / Test
+coverage/
+.coverage
+htmlcov/
+.nyc_output/
+
+# Misc
+*.tsbuildinfo
+*.local
