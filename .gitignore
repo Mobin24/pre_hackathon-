@@ -41,3 +41,4 @@ htmlcov/
 # Misc
 *.tsbuildinfo
 *.local
+puku.md
