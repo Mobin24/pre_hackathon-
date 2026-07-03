@@ -15,11 +15,12 @@ import Label from '../../shared/components/ui/Label.jsx';
 import Button from '../../shared/components/ui/Button.jsx';
 import Separator from '../../shared/components/ui/Separator.jsx';
 import { useUserAuth } from '../context/UserAuthContext.jsx';
-
-const BD_PHONE_REGEX = /^\+?8801[3-9]\d{8}$|^01[3-9]\d{8}$/;
-// Bangladesh NID is 10 or 13 digits (legacy + new smart card).
-const BD_NID_REGEX = /^\d{10}$|^\d{13}$/;
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+import {
+  signupSchema,
+  signinSchema,
+  formatZodError,
+  fieldErrorsFromZod,
+} from '../validation/authSchemas.js';
 
 export default function UserLogin() {
   const navigate = useNavigate();
@@ -48,23 +49,33 @@ export default function UserLogin() {
   }
 
   function validateSignup() {
-    if (!fullName.trim()) return 'Please enter your full name.';
-    if (!BD_NID_REGEX.test(nid.trim())) {
-      return 'NID must be 10 or 13 digits (Bangladesh national ID).';
-    }
-    if (!BD_PHONE_REGEX.test(phone.trim())) {
-      return 'Enter a valid Bangladesh phone number (e.g. 01712345678 or +8801712345678).';
-    }
-    if (!EMAIL_REGEX.test(email.trim())) {
-      return 'Please enter a valid email address.';
-    }
-    if (signupPassword.length < 8) {
-      return 'Password must be at least 8 characters.';
-    }
-    if (signupPassword !== confirmPassword) {
-      return 'Passwords do not match.';
-    }
-    return null;
+    const result = signupSchema.safeParse({
+      fullName,
+      nid,
+      phone,
+      email,
+      password: signupPassword,
+      confirmPassword,
+    });
+    if (result.success) return { ok: true };
+    return {
+      ok: false,
+      message: formatZodError(result.error),
+      fields: fieldErrorsFromZod(result.error),
+    };
+  }
+
+  function validateSignin() {
+    const result = signinSchema.safeParse({
+      identifier,
+      password: signinPassword,
+    });
+    if (result.success) return { ok: true };
+    return {
+      ok: false,
+      message: formatZodError(result.error),
+      fields: fieldErrorsFromZod(result.error),
+    };
   }
 
   function handleSubmit(e) {
@@ -72,9 +83,9 @@ export default function UserLogin() {
     setError('');
 
     if (mode === 'signup') {
-      const validationError = validateSignup();
-      if (validationError) {
-        setError(validationError);
+      const validation = validateSignup();
+      if (!validation.ok) {
+        setError(validation.message);
         return;
       }
       setBusy(true);
@@ -91,8 +102,9 @@ export default function UserLogin() {
         return;
       }
     } else {
-      if (!identifier.trim() || !signinPassword) {
-        setError('Please enter your email, phone, or NID and password.');
+      const validation = validateSignin();
+      if (!validation.ok) {
+        setError(validation.message);
         return;
       }
       setBusy(true);
@@ -124,7 +136,7 @@ export default function UserLogin() {
             </CardTitle>
             <CardDescription>
               {isSignup
-                ? 'Sign up to file incident reports and track their status.'
+                ? 'Full name, email, and password are required. NID and phone are optional — but you must provide at least one contact method.'
                 : 'Sign in to report incidents and follow up on your submissions.'}
             </CardDescription>
           </CardHeader>
@@ -179,7 +191,9 @@ export default function UserLogin() {
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="nid">National ID (NID)</Label>
+                    <Label htmlFor="nid">
+                      National ID (NID) <span className="text-slate-400">(optional)</span>
+                    </Label>
                     <Input
                       id="nid"
                       placeholder="10 or 13 digit Bangladesh NID"
@@ -191,7 +205,9 @@ export default function UserLogin() {
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="phone">Phone (Bangladesh)</Label>
+                    <Label htmlFor="phone">
+                      Phone (Bangladesh) <span className="text-slate-400">(optional)</span>
+                    </Label>
                     <Input
                       id="phone"
                       placeholder="01712345678 or +8801712345678"
