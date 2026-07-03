@@ -1,5 +1,10 @@
-import { AppRouter } from './router.jsx';
+import AppRouter from './router.jsx';
+import { UserAuthProvider } from './user/context/UserAuthContext.jsx';
 
 export default function App() {
-  return <AppRouter />;
+  return (
+    <UserAuthProvider>
+      <AppRouter />
+    </UserAuthProvider>
+  );
 }
