@@ -10,19 +10,19 @@ import Button from '../../shared/components/ui/Button.jsx';
 
 export default function AdminDashboard() {
   return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="border-b border-slate-200 bg-white">
+    <div className="min-h-screen bg-cream">
+      <header className="border-b border-olive-300 bg-white">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded-md bg-blue-600" />
-            <span className="font-semibold text-slate-900">
+            <div className="h-8 w-8 rounded-md bg-forest" />
+            <span className="font-semibold text-deep">
               ReliefGrid · Admin
             </span>
           </div>
           <div className="flex items-center gap-3">
             <Link
               to="/"
-              className="text-sm text-slate-600 hover:text-slate-900"
+              className="text-sm text-forest-700 hover:text-deep"
             >
               View public site
             </Link>
@@ -41,10 +41,10 @@ export default function AdminDashboard() {
 
       <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 space-y-6">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">
+          <h1 className="text-2xl font-bold text-deep">
             Operations dashboard
           </h1>
-          <p className="text-slate-600">
+          <p className="text-forest-800/80">
             All reports submitted from the public site will appear here with AI
             structure, severity, geo, and recommended relief actions.
           </p>
@@ -74,7 +74,7 @@ export default function AdminDashboard() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <p className="text-sm text-slate-600">
+            <p className="text-sm text-forest-800/80">
               Once the public Report Incident form is connected, every
               submission (with consent) will be AI-structured and queued here
               for triage, geo-tagging, and relief matching.
