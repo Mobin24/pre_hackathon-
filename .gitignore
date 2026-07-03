@@ -29,6 +29,9 @@ env/
 .DS_Store
 .puku/
 
+
+puku.md
+
 # Coverage / Test
 coverage/
 .coverage
