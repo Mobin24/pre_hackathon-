@@ -1,276 +1,521 @@
-# DRRCS Backend API — Auth Contract (v1)
+# DRRCS API · Backend → Frontend
 
-> This document is the **frontend contract** for the DRRCS backend authentication API.
-> It defines request/response shapes, status codes, error handling, CORS, and the JWT flow.
-> Always check `expires_in` to know when to refresh. Do **not** parse or trust the token payload client-side — call `/auth/me` instead.
-
-**Base URL (local dev):** `http://127.0.0.1:8000`
-**API version prefix:** `/auth`
-**OpenAPI / Swagger UI:** `http://127.0.0.1:8000/docs`
+> The canonical contract the frontend (React, under `frontend/`) talks to.
+> Every endpoint documented here lives in `backend/app/routes/`.
+>
+> **Base URL (local dev):** `http://localhost:8000`
+> **OpenAPI / Swagger UI:** `http://localhost:8000/docs`
+> **OpenAPI JSON:** `http://localhost:8000/openapi.json`
+> **Health check:** `GET http://localhost:8000/health` → `{ "status": "ok", "mongo": "ok" | "not_configured" | "error: …" }`
+>
+> **Auth model:** JWT bearer. Token from `/auth/login` or `/auth/register`. Send it on every non-auth call as:
+> `Authorization: Bearer <access_token>`
+>
+> **Last updated:** 2026-07-04
 
 ---
 
-## 1. Conventions
+## Table of contents
 
-### JSON only
-All requests and responses are JSON. Set `Content-Type: application/json`.
+1. [Endpoint → UI mapping table](#1-endpoint--ui-mapping-table)
+2. [Quick reference for every endpoint](#2-quick-reference-for-every-endpoint)
+3. [Conventions: errors, status codes, content types](#3-conventions-errors-status-codes-content-types)
+4. [All edge cases the frontend must handle](#4-all-edge-cases-the-frontend-must-handle)
+5. [Safely establishing the connection from the frontend](#5-safely-establishing-the-connection-from-the-frontend)
+6. [Troubleshooting checklist](#6-troubleshooting-checklist)
 
-### IDs
-User IDs are strings — MongoDB `ObjectId` serialized to hex (24 chars). Treat them as opaque.
+---
 
-### Timestamps
-ISO-8601 strings with timezone offset, e.g. `"2026-07-03T11:04:55.754470+00:00"`.
+## 1. Endpoint → UI mapping table
 
-### Error shape
-FastAPI's standard envelope:
-```json
-{ "detail": "Email already registered" }
-```
-For validation errors (422), `detail` is an array:
-```json
+Every HTTP endpoint the backend exposes, written in plain language, with a pointer to where the UI shows or submits it. Use the in-file pointer as a quick “where do I wire this?” — the next section lists the actual shapes.
+
+| # | Method | Path | Auth | Where it lives in the UI | Plain-language summary |
+|---|---|---|---|---|---|
+| 1 | `POST` | `/auth/register` | none | **`UserLogin.jsx`** → “New sign up” form | Create a citizen account (email + phone + BD NID + password). Returns a token so the UI can land the user straight on `/report`. |
+| 2 | `POST` | `/auth/login` | none | **`UserLogin.jsx`** → “Sign in” form **and** `AdminLogin.jsx` | Sign in with email, phone, or NID. Same endpoint for citizens and admins — `role` is read server-side from the DB. |
+| 3 | `GET` | `/auth/me` | required | **`UserAuthContext.jsx`** + **`AdminProtectedRoute.jsx`** | Returns the logged-in user’s public profile. Used to rehydrate the session on reload and to check the role. |
+| 4 | `POST` | `/api/report/submit` | required (citizen) | **`ReportIncident.jsx`** → `ReportForm.jsx` submit button | Citizen submits a new incident. Multipart form — fields + one or more image files. Triggers the AI pipeline (returns immediately, AI runs in the background). |
+| 5 | `GET` | `/api/report/{id}` | required (owner or admin) | **`IncidentDetail.jsx`**, dashboard incident modal | Fetch one processed report. Citizens see only their own; admins see everything. |
+| 6 | `GET` | `/api/report/{id}/images/{filename}` | none (public URL) | Wherever a report image is rendered | Streams the stored image bytes back. The report response includes fully-qualified `images[].url` already, so this is mostly for previews/sharing. |
+| 7 | `GET` | `/api/reports` | required (citizen sees own; admin sees all) | **`hooks/useReportsList.js`**, `services/api.js` `reportsApi.list` | List of reports, newest first. Supports `bbox`, `limit`, `offset` filtering. |
+| 8 | `PATCH` | `/api/reports/{id}/status` | admin | Admin dashboard → status chip / kebab menu | Admin advances the pipeline state (`pending_ai` ↔ `processed` / `failed` / `resolved`). Returns the updated report. |
+| 9 | `POST` | `/api/admin/reports/{id}/reprocess` | admin | Admin dashboard → “Re-run AI” button | Force the AI pipeline to run again on an already-processed report. |
+| 10 | `POST` | `/api/match/{report_id}` | required (owner or admin) | Dashboard → “Find relief” / `IncidentDetail.jsx` match panel | Ranked list of nearby resources for an incident. Commits nothing; safe to call repeatedly. |
+| 11 | `GET` | `/api/match/{report_id}/preview` | required (owner or admin) | Same panel → dry-run toggle | Same as #10 but a `GET`, handy for previews. |
+| 12 | `GET` | `/api/dashboard/stats` | admin | **`AdminDashboard.jsx`** stat tiles | Severity / status / resource counts for the dashboard top row. |
+| 13 | `GET` | `/api/dashboard/incidents` | admin | **`AdminDashboard.jsx`** incident table | Severity-first ranked list of incidents. Supports `severity`, `status`, `bbox`, `limit`, `offset`. |
+| 14 | `GET` | `/api/dashboard/incidents/{id}` | admin | **`AdminDashboard.jsx`** incident modal | One incident, full shape. |
+| 15 | `POST` | `/api/dashboard/incidents/{id}/dispatch` | admin | **`AdminDashboard.jsx`** → “Dispatch” button | Mark resources as dispatched to an incident. Body: `{ "resource_ids": [...], "notes": "..." }`. |
+| 16 | `POST` | `/api/dashboard/incidents/{id}/resolve` | admin | **`AdminDashboard.jsx`** → “Resolve” button | Mark an incident resolved; optionally restores the dispatched resources. |
+| 17 | `GET` | `/api/dashboard/feed` | admin | **`AdminDashboard.jsx`** polled every 5–10s | One-call bundle: `stats` + recent incidents + available resources. The polling endpoint. |
+| 18 | `GET` | `/api/geo/hotspots` | required | **`LiveMap.jsx`** heatmap layer | Aggregated incident density per geo cell for the live map. |
+| 19 | `GET` | `/api/resources` | required (admin for full; citizens see only `available:true`) | **`AdminDashboard.jsx`** resources rail | List of relief resources. |
+| 20 | `GET` | `/api/resources/{resource_id}` | required | Detail panels | One resource. |
+| 21 | `PATCH` | `/api/resources/{resource_id}/availability` | admin | **`AdminDashboard.jsx`** toggle | Flip a resource between `available:true/false`. |
+| 22 | `POST` | `/api/resources/reset` | admin | Admin → “Reset demo data” button | Reset every resource to `available:true` (demo helper). |
+| 23 | `POST` | `/api/sitrep/generate` | admin | Admin → “Generate sitrep” button | Force a fresh situation report (also auto-generated every hour by the server). |
+| 24 | `GET` | `/api/sitrep/latest` | admin | Admin → top-of-page headline strip | Returns the most recent sitrep, optionally filtered by divisions. |
+| 25 | `GET` | `/api/sitrep` | admin | Admin → sitrep history list | Recent N sitreps. |
+| 26 | `GET` | `/api/sitrep/{sitrep_id}` | admin | Admin → click a sitrep to expand | One sitrep. |
+| 27 | `GET` | `/api/sitrep/{sitrep_id}/export` | admin | Admin → “Export” button | Downloads the sitrep as text or PDF. |
+
+> The frontend today only calls a handful of these directly (the ones in `frontend/src/services/api.js` plus the auth + report-submit endpoints). Everything else should be added to `services/api.js` as the UI grows. Keep the URL string inside that file as the single source of truth.
+
+---
+
+## 2. Quick reference for every endpoint
+
+The shapes below are what actually goes over the wire. Anything you see in `ReportOut` / `UserPublic` / `ResourceOut` is the result of Pydantic’s serialization — if a field is `Optional`, the key may be omitted (or `null`); handle both.
+
+### 2.1 Auth
+
+**`POST /auth/register`** — register a citizen
+```http
+POST /auth/register
+Content-Type: application/json
+
 {
-  "detail": [
-    { "loc": ["body", "email"], "msg": "value is not a valid email address", "type": "value_error" }
-  ]
+  "full_name": "Anwar Hossain",
+  "email": "anwar@example.com",
+  "phone": "+8801712345678",
+  "nid": "1234567890123",
+  "password": "strongpass1"
 }
 ```
+- `200` → `{ "access_token": "...", "expires_in": 3600, "user": { "id", "name", "email", "nid", "phone", "role", "created_at", "updated_at" } }`
+- `409` → duplicate email/phone/NID — show the user a friendly “already registered, sign in instead” message.
 
-### Status codes you'll see
+**`POST /auth/login`**
+```http
+POST /auth/login
+Content-Type: application/json
+{ "identifier": "anwar@example.com", "password": "strongpass1" }
+```
+`identifier` can be email, phone (`+880…` or `01…`), or NID (10 or 13 digits).
+- `200` → `TokenResponse` (same shape as register).
+- `401` → invalid creds. The server returns a generic `"Invalid credentials"` — never tells you which half was wrong.
 
-| Code | Meaning | When |
+**`GET /auth/me`**
+- `200` → `UserPublic`.
+
+### 2.2 Reports (citizen)
+
+**`POST /api/report/submit`** — multipart, not JSON
+```http
+POST /api/report/submit
+Authorization: Bearer <token>
+Content-Type: multipart/form-data
+
+description        : "Flood water rising…"          (string, 10–4000)
+location           : '{"division":"Rangpur","district":"Kurigram",…}'   (JSON-encoded string)
+affected_count     : "120"                          (optional string of int)
+assistance         : '["rescue_team","shelter"]'    (JSON-encoded string array)
+immediate_danger   : "true"                         ("true"/"false")
+incident_time      : "within_1h"                    (or omit)
+notes              : "Local contact: …"             (or omit)
+submitted_at       : "2026-07-03T11:42:00.000Z"    (client clock, audit only)
+images             : <binary, one or more>          (image/*, ≤6 MB each, ≤5)
+```
+- `201` → `ReportOut`.
+- `422` → validation failure (description too short, bad incident_time, …). Show the human message in the toast.
+- `429` → rate-limited (5 submits per 60 seconds per user). The response carries `Retry-After` in seconds — surface that as a “try again in N s” toast.
+
+**`GET /api/report/{id}`**
+- Citizens: only their own reports. Anyone else → `403`.
+- Admins: anything.
+
+**`GET /api/report/{id}/images/{filename}`**
+- No auth needed; the URL acts as a capability. Returns the image bytes with the correct `Content-Type`.
+- `404` if the image is no longer on disk (post-reset demo, accidental `rm`). UI should show a placeholder, not break.
+
+**`GET /api/reports`** — paginated list
+- Query params: `bbox=west,south,east,north` (optional), `limit=1..500` (default 100), `offset=0..100000` (default 0).
+- Citizens get `{ "items": [...their own...], "count", "total", "offset", "limit" }`.
+- Admins get `{ "items": [...all...], ... }`. Always sorted by `created_at` desc.
+
+### 2.3 Reports (admin)
+
+**`PATCH /api/reports/{id}/status`**
+```http
+PATCH /api/reports/{id}/status
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{ "status": "resolved", "notes": "Field team confirmed clear" }
+```
+Allowed `status` values: `pending_ai`, `processed`, `failed`, `resolved`. Only four transitions are permitted (any other pair → `409`):
+- `processed → resolved`
+- `pending_ai → failed`
+- `failed → pending_ai`
+- `processed → pending_ai` (triggers a re-run of the AI pipeline)
+
+**`POST /api/admin/reports/{id}/reprocess`**
+- Body: none.
+- `200` → refreshed `ReportOut`.
+
+### 2.4 Match (relief)
+
+**`POST /api/match/{report_id}?radius_km=25&top_n=3`**
+- `radius_km`: `0.5..200` (default 25). `top_n`: `1..10` (default 3).
+- `404` if the report doesn’t exist or the caller can’t see it.
+- `200` → `MatchResult` with ranked candidates `{ score, distance_km, resource: {...}, reasons: [...] }`.
+
+**`GET /api/match/{report_id}/preview?radius_km=25`** — same payload, `GET`, no commit.
+
+### 2.5 Dashboard (admin)
+
+**`GET /api/dashboard/stats?window_hours=24`**
+- `window_hours`: `1..720`. Default 24.
+- Returns: `{ window_hours, last_updated, incidents: { total, by_severity, by_status, critical, high, active }, resources: { total, available, in_use, by_type[] }, actions: { pending_dispatch, in_progress, failed } }`.
+
+**`GET /api/dashboard/incidents`**
+- Query: `severity=critical|high|medium|low` (omit for all), `status=active|pending_ai|processed|failed|resolved|all` (default `active`), `bbox=…`, `limit`, `offset`.
+- Sorted critical-first then newest-first.
+- Citizens **do not** have access — they should keep using `/api/reports`.
+
+**`GET /api/dashboard/incidents/{id}`** — single.
+
+**`POST /api/dashboard/incidents/{id}/dispatch`**
+```json
+{ "resource_ids": ["65fa...", "65fb..."], "notes": "Rescue boat dispatched" }
+```
+- `400` if no `resource_ids` or none are valid ObjectIds.
+- `404` if the incident id is unknown.
+
+**`POST /api/dashboard/incidents/{id}/resolve`**
+```json
+{ "restore_resources": true, "notes": "All clear" }
+```
+- `restore_resources` defaults to `true` if omitted. Sets `resolved_at`, stamps `resolved_by`, and flips the last batch of dispatched resources back to `available:true`.
+
+**`GET /api/dashboard/feed?limit=10`**
+- One round-trip for the whole dashboard: `{ last_updated, stats, incidents: ReportListOut, resources: ResourceListOut }`. Use this for the polling loop instead of three separate calls.
+
+### 2.6 Geo
+
+**`GET /api/geo/hotspots`** — query params:
+- `bbox=west,south,east,north` (recommended; without it the server has to scan everything).
+- `grid_size=0.05` (degrees; default 0.05 ≈ 5 km cells).
+- `window_hours=24` (default).
+
+Returns `[{ cell: { lat, lng }, count, dominant_severity, dominant_type }]` for the map layer.
+
+### 2.7 Resources
+
+**`GET /api/resources`** — query: `available_only=true|false` (admin default `false`), `limit`.
+**`GET /api/resources/{resource_id}`** — one.
+**`PATCH /api/resources/{resource_id}/availability`** — admin: `{ "available": false }`.
+**`POST /api/resources/reset`** — admin, no body. Resets **all** resources to `available:true`. Demo-only convenience.
+
+### 2.8 Sitreps (admin)
+
+**`POST /api/sitrep/generate`** — body:
+```json
+{
+  "window_hours": 24,
+  "divisions": ["Dhaka", "Chattogram"],
+  "max_incidents_to_summarize": 25,
+  "trigger": "manual"
+}
+```
+**`GET /api/sitrep/latest?divisions=Dhaka&divisions=Chattogram`**
+**`GET /api/sitrep?limit=10&divisions=…`**
+**`GET /api/sitrep/{sitrep_id}`**
+**`GET /api/sitrep/{sitrep_id}/export?format=pdf|text`** — text by default. Streams a file.
+
+---
+
+## 3. Conventions: errors, status codes, content types
+
+### 3.1 Error envelope
+
+Every failure uses this shape via FastAPI's `HTTPException(detail=…)`:
+```json
+{ "success": false, "error": "Human-readable message", "...extra": "..." }
+```
+Frontend rule of thumb:
+1. `axios` throws on any 4xx/5xx. The body sits on `err.response.data`.
+2. The message to show the user is `err.response.data?.error || err.message`. Never show `err.stack`.
+
+### 3.2 Status codes you will actually see
+
+| Status | When | UI behaviour |
 |---|---|---|
-| `200` | OK | Successful read or login |
-| `201` | Created | Successful register |
-| `401` | Unauthorized | Missing token, bad signature, expired token, wrong password |
-| `403` | Forbidden | Token is valid but role doesn't match |
-| `409` | Conflict | Email already registered |
-| `422` | Unprocessable Entity | Validation failed (bad email, short password, etc.) |
-| `503` | Service Unavailable | MongoDB not configured on the server |
+| `200` / `201` | Success | Render. |
+| `400` | Bad input (e.g. `bbox` degenerate, bad resource id). | Inline form error or a banner. |
+| `401` | Missing / expired JWT. | Clear token, bounce to `/login`. |
+| `403` | Wrong role, or citizen asking for someone else’s report. | “You don’t have access to this report.” |
+| `404` | Resource not found / image byte missing / not-yet-generated sitrep. | Empty state component (`EmptyState`). |
+| `409` | Illegal status transition or duplicate signup. | Disable the offending action; explain. |
+| `422` | Pydantic validation failed (e.g. description too short). | Map `error` to the relevant form field if possible. |
+| `429` | Rate-limited (reports submit + login). | Respect `Retry-After`. |
+| `500` | AI failed, unhandled crash. | Generic “try again in a moment” toast, log to console. |
+| `503` | Mongo not configured. | Show a banner: “API not connected to a database”. |
 
-### CORS
-Backend allows `CORS_ORIGINS` from `.env` (default `http://localhost:5173`).
-Credentials (`Authorization` header) are allowed. Cookies/sessions are **not** used — JWT only.
+### 3.3 Content types
+
+- Auth + most request bodies: `application/json`.
+- `POST /api/report/submit`: `multipart/form-data` (the only multipart endpoint). Native `FormData` works — set `Content-Type` to `undefined` so the browser sets the boundary.
+- `GET /api/sitrep/{id}/export`: `text/plain` or `application/pdf`. Trigger a file download with a hidden `<a download>`.
 
 ---
 
-## 2. Endpoints
+## 4. All edge cases the frontend must handle
 
-### 2.1 `POST /auth/register`
+This is the list of behaviours that **will** happen during the demo and that the UI must not crash on. Each one points to the endpoint(s) it can come from.
 
-Create a new user account and immediately return a signed access token.
+### 4.1 Auth & session
 
-**Request body**
-```json
-{
-  "name": "Alice",
-  "email": "alice@example.com",
-  "password": "goodpass1",
-  "role": "citizen"
-}
+1. **Stale token after server restart** — JWT secret rotates, every previous token is dead.
+   *Source:* `get_current_user` (`deps.py`).
+   *UI:* A single 401 from any endpoint should clear the cached token (`useAuth().logout`) and redirect to `/login` with a one-time toast “Session expired”.
+2. **User logs in as a citizen at `/admin/login`** (or vice versa).
+   *Source:* `auth/login`.
+   *UI:* After login, check `user.role`. If a citizen arrives at `/admin/dashboard`, bounce them to `/`. If an admin arrives at `/report`, either block the form or just allow it (admin-as-citizen is fine).
+3. **Duplicate signup** (email already registered).
+   *Source:* `POST /auth/register` → `409`.
+   *UI:* Inline “This email is already registered. Sign in instead?” with a one-click flip to the Sign in tab.
+4. **Identifier used is a phone that belongs to a different account** vs. **phone not registered**.
+   *Source:* `POST /auth/login` → `401`.
+   *UI:* Same generic error: “Invalid email/phone/NID or password”. Never reveal that the phone is unknown.
+5. **Lost session after a refresh** — token cleared from `localStorage` by the user.
+   *Source:* session bootstrap.
+   *UI:* On mount, call `/auth/me` once. If it 401s, treat as logged out. Don’t show a flash of the logged-in state.
+
+### 4.2 Report submission
+
+6. **Description too short** after trim.
+   *Source:* `POST /api/report/submit` → `422` with message.
+   *UI:* Server is the source of truth, but the form already disables submit when `description.trim().length < 10`. Show the server’s message if you somehow bypass the client check.
+7. **`division` changed by the user mid-flight while district no longer belongs to it**.
+   *Source:* client-driven inconsistency.
+   *UI:* On change of `division`, reset `district` and `upazila`. If the user submits without a valid (server-recognized) `division`, show 422.
+8. **Image too big or wrong mime**.
+   *Source:* dropzone already caps at 6 MB / `image/*`. The backend also enforces image MIME via storage helpers.
+   *UI:* If the backend rejects an image (`error: "File type not allowed"`), drop just that file from `FormData` and toast the user. Don't kill the whole submit.
+9. **Network drop mid-upload**.
+   *Source:* axios.
+   *UI:* Use the `onUploadProgress` callback to show a thin progress bar. On fail, retry once after 1.5 s with exponential backoff (max 2 retries). After that, surface “Submission failed — retry?” with the prior payload still in state.
+10. **Double-tap submit button**.
+    *Source:* `POST /api/report/submit` rate-limit + dedupe (`REPORT_RL_MAX=5` per 60 s, dedupe window 30 s).
+    *UI:* Disable the button the moment the request fires. If the user *does* double-tap and gets back a 429, show “Whoa, too many submissions — wait N seconds”. The dedupe window means an identical payload returns the same report id, which is **safe** — the UI can ignore duplicates.
+11. **AI pipeline marks the report `failed`** (OpenAI down or malformed response).
+    *Source:* `ReportOut.status === "failed"` + `ReportOut.error`.
+    *UI:* Show a banner on the success page: “Saved — but our AI had a hiccup. A human will review shortly.” The report is still persisted, so the user can be confident it isn’t lost.
+12. **AI returns a low-confidence result** (`ai_output.combined.confidence < 0.4`).
+    *Source:* same as above.
+    *UI:* Tag the preview card with a low-confidence badge; mention that admins will verify.
+13. **Report status changes after submit**.
+    *Source:* background AI pipeline.
+    *UI:* On the success screen, return `status: "pending_ai"`. If the UI later navigates to detail and finds `status: "processed"`, render the AI block. Don't poll from the success screen — the dashboard polls `/api/dashboard/feed`.
+
+### 4.3 Listing & filtering
+
+14. **Empty result set** (e.g. “no reports in this division yet”).
+    *Source:* `GET /api/reports` → `{ items: [], total: 0, count: 0 }`.
+    *UI:* Render the `EmptyState` component. Don’t silently render nothing.
+15. **Pagination beyond the end**.
+    *Source:* `GET /api/reports?offset=10000`.
+    *UI:* Honour `total`: clamp the next-page button or use `total - offset` to detect the last page.
+16. **`bbox` from the live map is degenerate** (the user zoomed all the way in).
+    *Source:* client-side bug.
+    *UI:* Client-side guard: only send `bbox` when all four numbers are finite and `west < east && south < north`.
+17. **Search by `query` (text) is not yet a server-side param** — the current backend accepts `limit`/`offset`/`bbox` but not a free-text filter.
+    *UI:* Either keep filtering client-side over the page slice (current behaviour in `useReportsList.js`), or call the AI later. Don’t pretend the server is doing it.
+
+### 4.4 Images & media
+
+18. **Image URL points to a missing file**.
+    *Source:* `GET /api/report/{id}/images/{filename}` → `404`.
+    *UI:* `<img onError={() => setBroken(true)} />` + a placeholder icon.
+19. **CORS block on image fetch** (different host in prod).
+    *Source:* browser-side.
+    *UI:* Backend already sets `CORSMiddleware` with `allow_origins` from env. If something still trips, log the actual origin mismatch and add it to `cors_origins_list` in `core/config.py`.
+
+### 4.5 Admin dashboard
+
+20. **Incident race**: two admins try to dispatch the same resources.
+    *Source:* `POST /api/dashboard/incidents/{id}/dispatch`.
+    *UI:* Refresh the resource availability after dispatch and disable buttons whose resources are now `available:false`. Server is idempotent on the underlying `update_many` — calling twice just re-marks them.
+21. **Resolve called before dispatch** (nothing to restore).
+    *Source:* server returns `200` with `resources_restored: 0`.
+    *UI:* Still show success, just don’t claim “we freed up resources”.
+22. **Status transition outside the allowed set**.
+    *Source:* `PATCH /api/reports/{id}/status` → `409`.
+    *UI:* The response includes `allowed_transitions_from_current` in `detail` — render only those buttons. Hide the rest.
+23. **Reprocess after AI was already in `pending_ai`** (nothing to do).
+    *Source:* `POST /api/admin/reports/{id}/reprocess` → either 200 with the same doc, or fresh output.
+    *UI:* Show a spinner while waiting; the response is the source of truth.
+24. **`/api/dashboard/feed` polling storms**.
+    *Source:* client bug.
+    *UI:* The contract is 5–10 s intervals. Cap at 1 call per 4 s, pause polling when the tab is `document.hidden`, resume on `visibilitychange === 'visible'`.
+25. **`last_updated` hasn’t changed in N polls** → don’t re-render the top tiles. Cheap optimization.
+
+### 4.6 Geo / map
+
+26. **Hotspots endpoint returns 200 but the `bbox` was missing or invalid**.
+    *Source:* server returns `[]` (no filter → no I/O cost wall but also no useful answer for a huge country).
+    *UI:* Always send `bbox` from the visible map viewport.
+27. **Cell with `count > 0` but no `dominant_severity`** (the cell aggregates only `pending_ai` failures).
+    *UI:* Default the marker color to `medium`, not `unknown`.
+
+### 4.7 Sitrep
+
+28. **No sitrep generated yet**.
+    *Source:* `GET /api/sitrep/latest` → `404`.
+    *UI:* Show “Generating first briefing…” and silently retry every 30 s (the 1-hour auto-tick will fill it in).
+29. **`/api/sitrep/{id}/export?format=pdf` returns 500** if the PDF path is broken on the server.
+    *UI:* Fallback to `format=text` automatically.
+
+### 4.8 Network / infra
+
+30. **CORS preflight fails** because the frontend origin isn’t in `cors_origins_list`.
+    *Source:* `CORSMiddleware` config in `app/main.py`.
+    *UI:* A console `AxiosError: Network Error` with no response body. Backend fix is one env var; document the origin and add it.
+31. **Mongo is not configured** (`backend/.env` missing `MONGODB_URI`).
+    *Source:* every endpoint that hits a DB returns `503`.
+    *UI:* Treat as a fatal startup problem; show the “API not connected” banner instead of the dashboard.
+32. **Token in `localStorage` becomes invalid** while a long-polling tab is open.
+    *Source:* §4.1.
+    *UI:* Detect on next polling response, stop polling, redirect.
+
+---
+
+## 5. Safely establishing the connection from the frontend
+
+These are the steps a frontend dev (or this assistant on a future turn) should follow to wire `frontend/src/services/api.js` to the real backend without breaking the mock.
+
+### 5.1 In `frontend/.env` (or `.env.local`)
+
+```bash
+# When this is "false", the service layer stops using mockData.js.
+VITE_USE_MOCK=false
+
+# Where the backend lives. Local dev default is shown; staging/prod
+# are different env files.
+VITE_API_BASE_URL=http://localhost:8000
 ```
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `name` | string | yes | 1–100 chars, trimmed server-side |
-| `email` | string | yes | RFC-compliant email, lowercased on save |
-| `password` | string | yes | 8–128 chars |
-| `role` | `"citizen"` \| `"admin"` | no | Defaults to `"citizen"`. Production typically rejects `"admin"` self-assignment — current MVP allows it. |
+Do **not** commit a production URL to the repo. Use a `.env.example` instead.
 
-**Success — `201 Created`**
-```json
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "token_type": "bearer",
-  "expires_in": 86400,
-  "user": {
-    "id": "6a4797572ab462cfec9ead03",
-    "name": "Alice",
-    "email": "alice@example.com",
-    "role": "citizen",
-    "created_at": "2026-07-03T11:04:55.754470+00:00",
-    "updated_at": "2026-07-03T11:04:55.754470+00:00"
+### 5.2 In `frontend/src/services/api.js`
+
+The file already has:
+```js
+const USE_MOCK =
+  import.meta?.env?.VITE_USE_MOCK === undefined
+    ? true
+    : String(import.meta.env.VITE_USE_MOCK).toLowerCase() !== 'false';
+```
+This is the right toggle. When `VITE_USE_MOCK=false`, the `if (USE_MOCK)` branches in `reportsApi` / `dashboardApi` skip and the real axios calls run. Add the new endpoints behind the same flag — never delete the mock until the UI has been validated end-to-end on real data.
+
+### 5.3 Set up an axios instance with auth + error plumbing
+
+Replace the bare `axios.create({...})` with a configured one. Keep it in `services/api.js` so the whole app inherits the behaviour:
+```js
+import axios from 'axios';
+
+const TOKEN_KEY = 'rg_access_token';
+
+export const apiClient = axios.create({
+  baseURL: import.meta?.env?.VITE_API_BASE_URL || 'http://localhost:8000',
+  timeout: 15000,
+});
+
+// Attach the JWT to every request automatically.
+apiClient.interceptors.request.use((cfg) => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) cfg.headers.Authorization = `Bearer ${token}`;
+  // multipart uploads must not force a Content-Type — let the browser
+  // set the boundary header itself.
+  if (cfg.data instanceof FormData) {
+    delete cfg.headers['Content-Type'];
   }
-}
+  return cfg;
+});
+
+// On 401, drop the token so the rest of the app can route to /login.
+apiClient.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem(TOKEN_KEY);
+      // Defer navigation to a route guard; setting window.location here
+      // would interrupt in-flight requests unpredictably.
+      window.dispatchEvent(new CustomEvent('rg:auth:expired'));
+    }
+    return Promise.reject(err);
+  },
+);
 ```
 
-**Errors**
-- `409 Conflict` — `{"detail":"Email already registered"}`
-- `422` — validation (bad email / short password / name too long)
-- `503` — Mongo not configured (backend offline)
+### 5.4 Token storage + login
 
-**Frontend implications**
-- Persist `access_token` (e.g. `localStorage` or in-memory) and the `user` object.
-- Decode `expires_in` (seconds) once to know when to force re-auth.
-- Do **not** trust the `role` field for routing until you also call `/auth/me` on app load — the role could have changed since issue.
+`UserAuthContext.jsx` and `AdminLogin.jsx` currently use a stub. Replace with:
+1. On register/login success → `localStorage.setItem(TOKEN_KEY, response.access_token)`.
+2. Stash `response.user` in React state (or another localStorage key).
+3. On boot → if `TOKEN_KEY` exists, fire `GET /auth/me` once and rehydrate `user`.
+4. On logout → `localStorage.removeItem(TOKEN_KEY)` and reset state.
+
+This keeps backwards compatibility with the existing UI keys (`rg_user_session_v1`, `rg_admin_auth`) — those can remain as “UI-side flags” that just gate routing, not auth.
+
+### 5.5 Calling endpoints for the first time — the safe order
+
+Do this in order; do not skip ahead. Each step ends with a manual verification.
+
+1. **Health ping.** Open `http://localhost:8000/health` in the browser. You should see `{"status":"ok","mongo":"ok"}`. If `mongo` is `not_configured`, the backend is up but no DB is wired — every endpoint will 503.
+2. **Auth round-trip.** From a JS console:
+   ```js
+   const { data } = await fetch('http://localhost:8000/auth/login', {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ identifier: 'admin@reliefgrid', password: '<seeded-admin-password>' })
+   }).then(r => r.json());
+   console.log(data.access_token);
+   ```
+   Replace the password with whatever `backend/scripts/seed_admin.py` wrote. If you get a token, the JWT path is alive end-to-end.
+3. **Submit a test report (multipart).** Use the React form — it already builds the right `FormData`. Hit submit, expect a `201` with a non-empty `id`. If you get `422`, read the `error` and update the form.
+4. **Read it back.** `GET /api/reports/{id}` with the same token should return the same shape. The dashboard list (`GET /api/reports`) should now contain it.
+5. **Wait for the AI pipeline.** Within ~10 s the document’s `status` becomes `processed` and `ai_output.combined` is populated. Polling `/api/reports/{id}` is the simplest verification.
+6. **Switch `VITE_USE_MOCK=false`** in `.env.local` and restart Vite. From this point the React UI hits the real backend.
+
+### 5.6 CORS sanity (do this before any of the steps above once you’ve touched origins)
+
+If the frontend is on a different origin (e.g. `:5173`) the browser will preflight every non-GET request. Verify with:
+```bash
+curl -i -X OPTIONS http://localhost:8000/auth/login \
+  -H 'Origin: http://localhost:5173' \
+  -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type'
+```
+You should see `Access-Control-Allow-Origin: http://localhost:5173`. The backend’s `cors_origins_list` (in `core/config.py`, fed by env) must include it. Add origins via the env, never in code.
+
+### 5.7 The shape the frontend should expect
+
+Three rules so nothing breaks:
+
+- **Always read `data.items` / `data.user` / `data.access_token` on a 200/201.** The error path uses `err.response.data.error`.
+- **Treat every field marked `Optional` in `app/schemas/*` as missing-or-null.** Use `report?.ai_output?.combined?.severity` style optional chains, never direct property access.
+- **Never trust `submitted_at` from the client.** Backend stamps `created_at`. Anything that orders reports should sort by `created_at` (desc) — `services/api.js` already does `b.submittedAt - a.submittedAt` for the mock; switch the comparison to `created_at` when real data arrives.
 
 ---
 
-### 2.2 `POST /auth/login`
+## 6. Troubleshooting checklist
 
-Authenticate with email + password.
+When something looks wrong, walk this list top-to-bottom.
 
-**Request body**
-```json
-{ "email": "alice@example.com", "password": "goodpass1" }
-```
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `email` | string | yes | Looked up lowercased |
-| `password` | string | yes | At least 1 char (the hash check enforces actual strength) |
-
-**Success — `200 OK`**
-
-Same `TokenResponse` shape as `/auth/register`:
-```json
-{
-  "access_token": "...",
-  "token_type": "bearer",
-  "expires_in": 86400,
-  "user": { "id": "...", "name": "...", "email": "...", "role": "citizen", "created_at": "...", "updated_at": "..." }
-}
-```
-
-**Errors**
-- `401 Unauthorized` — `{"detail":"Invalid email or password"}` (intentionally vague — same response for unknown email vs. wrong password, to prevent enumeration)
-
-**Frontend implications**
-- Single error message — show "Invalid email or password" for both cases.
-- On success, replace any existing stored token.
+1. **`/health` works but every other call 503s** → `MONGODB_URI` is unset or the cluster is unreachable.
+2. **`/health` errors with `error: <message>`** → backend can’t even reach Mongo. Check credentials / IP allowlist on Atlas.
+3. **Login returns `401` but you’re sure the password is right** → identifier is being normalized differently (e.g. an extra space, a `+880` vs `01…` mismatch). Use the exact form they signed up with.
+4. **`/api/report/submit` returns `422` and the form looks fine** → at least one of `description/location/assistance/incident_time` is sending a value the server didn’t expect. The error string usually names the field.
+5. **`/api/report/submit` returns `413`/timeout** → image is too large; the dropzone cap is 6 MB but a raw `FormData` bypass can slip through.
+6. **`/api/dashboard/*` returns `403`** → the cached token is a citizen role. Sign out and sign back in with an admin seed account.
+7. **CORS preflight returns the wrong `Access-Control-Allow-Origin`** → add the frontend origin to `cors_origins_list` (env var), then restart uvicorn.
+8. **OpenAI-related failures (`status: "failed"` on report)** → backend logs the error in `app/services/report.py`. The report is still saved — admins can fix it via `PATCH /api/reports/{id}/status` and `POST /api/admin/reports/{id}/reprocess`.
+9. **`/api/sitrep/latest` is `404` after a fresh server start** → the 1-hour auto-tick hasn’t run yet. Manually `POST /api/sitrep/generate` once for the demo.
+10. **Token works for `/auth/me` but not for `/api/reports`** → JWT decoded but `user_id` doesn’t exist in Mongo (server-restart between token issue and check). Sign in again.
 
 ---
 
-### 2.3 `GET /auth/me`
-
-Return the current user's profile using the bearer token.
-
-**Headers**
-```
-Authorization: Bearer <access_token>
-```
-
-**Success — `200 OK`**
-```json
-{
-  "id": "6a4797572ab462cfec9ead03",
-  "name": "Alice",
-  "email": "alice@example.com",
-  "role": "citizen",
-  "created_at": "2026-07-03T11:04:55.754470+00:00",
-  "updated_at": "2026-07-03T11:04:55.754470+00:00"
-}
-```
-
-**Errors**
-- `401 Unauthorized` with one of:
-  - `{"detail":"Not authenticated"}` — no `Authorization` header
-  - `{"detail":"Invalid or expired token"}` — bad signature / expired / malformed
-  - `{"detail":"User no longer exists"}` — token is valid but the user was deleted
-
-**Frontend implications**
-- Use this on app load to validate a stored token and refresh user state.
-- Do **not** trust `localStorage` blindly — token could be expired or revoked (user deleted).
-
----
-
-## 3. JWT details (for reference only)
-
-- **Algorithm:** `HS256`
-- **Lifetime:** `TOKEN_EXPIRY_MINUTES` from backend `.env` (default `1440` = 24h)
-- **Payload claims:**
-  ```json
-  { "sub": "<user_id>", "role": "citizen|admin", "iat": <unix>, "exp": <unix> }
-  ```
-- **Header value:** `Authorization: Bearer <token>`
-
-> ⚠️ **Don't decode the JWT client-side for authorization decisions.** The token's role can be revoked server-side. Always re-check via `/auth/me` or a role-gated endpoint.
-
----
-
-## 4. TypeScript-style shapes (copy-paste into `frontend/src/services/api.ts`)
-
-```ts
-export type Role = "citizen" | "admin";
-
-export interface UserPublic {
-  id: string;
-  name: string;
-  email: string;
-  role: Role;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface TokenResponse {
-  access_token: string;
-  token_type: "bearer";
-  expires_in: number;     // seconds
-  user: UserPublic;
-}
-
-export interface RegisterPayload {
-  name: string;
-  email: string;
-  password: string;
-  role?: Role;            // defaults to "citizen"
-}
-
-export interface LoginPayload {
-  email: string;
-  password: string;
-}
-
-export interface ApiError {
-  detail: string | Array<{ loc: (string | number)[]; msg: string; type: string }>;
-}
-
-export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
-```
-
----
-
-## 5. Minimal frontend helper (reference)
-
-```ts
-async function authFetch<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(init.headers as Record<string, string> | undefined),
-  };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
-  if (!res.ok) {
-    const err: ApiError = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiHttpError(res.status, err);
-  }
-  return res.json() as Promise<T>;
-}
-
-export class ApiHttpError extends Error {
-  constructor(public status: number, public body: ApiError) {
-    super(typeof body.detail === "string" ? body.detail : "Request failed");
-  }
-}
-```
-
----
-
-## 6. End-to-end flow
-
-```
-1. User signs up           → POST /auth/register      → store { token, user }
-2. User signs in later     → POST /auth/login         → store { token, user }
-3. User reloads the app    → GET  /auth/me            → if 401, force re-login
-4. Token expires           → next protected call returns 401
-                              → frontend: clear stored token, redirect to /login
-5. Admin-only screens      → POST/PUT/DELETE endpoints with `Depends(require_role("admin"))`
-                              will return 403 with `{"detail":"Requires role: admin"}`
-                              if a citizen's token is presented.
-```
-
----
-
-## 7. Versioning & stability
-
-- This contract corresponds to **backend Phase 2 (Auth)**. Other endpoints (`/api/report/...`) are documented separately.
-- Any breaking change (renaming fields, switching to refresh tokens, changing `expires_in`) will bump the API version prefix.
+*If you add a new endpoint, update §1, §2, and any new edge-case bullets in §4 — the document is the contract.*

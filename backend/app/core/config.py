@@ -22,7 +22,20 @@ class Settings(BaseSettings):
 
     # AI
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
+    # Cheap text-only model for cheap structured extraction.
+    openai_text_model: str = Field(default="gpt-4o-mini", alias="OPENAI_TEXT_MODEL")
+    # Moderate vision-capable model for image analysis.
+    openai_vision_model: str = Field(default="gpt-4o-mini", alias="OPENAI_VISION_MODEL")
+    # Cheapest model for rolling up many reports into a situation summary.
+    openai_summary_model: str = Field(default="gpt-4o-mini", alias="OPENAI_SUMMARY_MODEL")
+    # Soft timeout for any single AI call (seconds).
+    openai_timeout_seconds: float = Field(default=20.0, alias="OPENAI_TIMEOUT_SECONDS")
+    # Auto-recovery threshold in seconds for stuck `pending_ai` docs.
+    ai_recovery_threshold_seconds: int = Field(default=60, alias="AI_RECOVERY_THRESHOLD_SECONDS")
+    # How often the background task generates a fresh global sitrep.
+    # Set to 0 to disable (admin still has POST /api/sitrep/generate).
+    # Default: 3600 seconds = 1 hour. Overridable via SITREP_TICK_SECONDS env.
+    sitrep_tick_seconds: float = Field(default=3600.0, alias="SITREP_TICK_SECONDS")
 
     # MongoDB
     mongodb_uri: str = Field(default="", alias="MONGODB_URI")
